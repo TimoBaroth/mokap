@@ -18,8 +18,9 @@ import shlex
 import re
 
 from mokap.utils import fileio
-from mokap.core.hardware import SSHTrigger, BaslerCamera, setup_ulimit, enumerate_basler_devices
+from mokap.core.hardware import SSHTrigger, BaslerCamera, setup_ulimit, enumerate_basler_devices, SerialTrigger
 
+import csv
 
 class MultiCam:
     COLOURS = ['#3498db', '#f4d03f', '#27ae60', '#e74c3c', '#9b59b6', '#f39c12', '#1abc9c', '#F5A7D4', '#34495e', '#bdc3c7',
@@ -29,7 +30,13 @@ class MultiCam:
                  framerate=220,
                  exposure=4318,
                  triggered=False,
-                 silent=True):
+                 silent=True,
+                 mqttlogger=''):
+
+        self.mqttlogger = mqttlogger
+        self._mqtt_recording: bool = False
+        if self.mqttlogger:
+            self._mqtt_recording = True
 
         self.config_dict = fileio.read_config(config)
 
@@ -55,7 +62,7 @@ class MultiCam:
         self._triggered = triggered
 
         if self._triggered:
-            self.trigger = SSHTrigger()
+            self.trigger = SerialTrigger()
         else:
             self.trigger = None
 
@@ -88,7 +95,7 @@ class MultiCam:
 
         self._acquiring: bool = False
         self._recording: bool = False
-
+        
         self._nb_cams: int = 0
 
         self._sources_dict = {}
@@ -106,6 +113,7 @@ class MultiCam:
         self._l_finished_saving: List[Event] = []
         self._l_all_frames: List[deque] = []
         self._l_latest_frames: List[deque] = []
+        self._l_mqtt_readings: List[deque] = []
 
         # Initialise a list of subprocesses
         self._videowriters: List[Union[bool, subprocess.Popen]] = []
@@ -121,6 +129,7 @@ class MultiCam:
             self._l_all_frames.append(deque())
             self._l_latest_frames.append(deque(maxlen=1))
             self._videowriters.append(False)
+            self._l_mqtt_readings.append(deque())
 
         # Init frames counters
         self._cnt_grabbed = RawArray('I', int(self._nb_cams))
@@ -134,7 +143,7 @@ class MultiCam:
     @triggered.setter
     def triggered(self, new_val: bool):
         if not self._triggered and new_val:
-            external_trigger = SSHTrigger(silent=self._silent)
+            external_trigger = SerialTrigger(silent=self._silent)
             if external_trigger.connected:
                 self.trigger = external_trigger
                 self._triggered = True
@@ -188,6 +197,7 @@ class MultiCam:
                                exposure=self._exposure,
                                triggered=self._triggered,
                                binning=self._binning)
+            
             source.connect(cptr)
 
             if source.connected:
@@ -201,7 +211,13 @@ class MultiCam:
                         source_col = f"#{self.config_dict['sources'][n].get('color', source_col).lstrip('#')}"
 
                 self._cameras_colours[source.name] = source_col
-
+                
+                # Set user set if specified in config file
+                for n in config_sources_names:
+                    if source.serial == str(self.config_dict['sources'][n].get('serial', 'virtual')):
+                        if self.config_dict['sources'][n].get('user_set') != None:
+                            source.set_userset(str(self.config_dict['sources'][n].get('user_set')))
+                        
                 # Keep references of cameras as list and as dict for easy access
                 self._sources_list.append(source)
                 self._sources_dict[source.name] = source
@@ -373,6 +389,7 @@ class MultiCam:
         """
 
         queue = self._l_all_frames[cam_idx]
+        queue_mqtt = self._l_mqtt_readings[cam_idx]
 
         h = self._sources_list[cam_idx].height
         w = self._sources_list[cam_idx].width
@@ -381,6 +398,16 @@ class MultiCam:
         if 'mp4' not in self._saving_ext:
             folder = self.full_path / f"{self.session_name}_cam{cam_idx}_{self._sources_list[cam_idx].name}"
             folder.mkdir(parents=True, exist_ok=True)
+        
+        if self._mqtt_recording:
+            csv_file_path = self.full_path / f"labels_cam{cam_idx}_{self._sources_list[cam_idx].name}.csv"
+            csv_file = open(csv_file_path, "w", newline='')
+            csv_writer = csv.writer(csv_file, dialect='excel')
+            header = ['Image']
+            for item in self.mqttlogger.values:
+                header.append(str(item))
+            csv_writer.writerow(header)
+
 
         def save_frame(frame, number):
             """
@@ -424,6 +451,12 @@ class MultiCam:
             # (the actual number of written files is counted in a safe way when recording stops)
             self._cnt_saved[cam_idx] += 1
 
+        def save_labels(writer, number, values):
+            csv_row = [str(number)]
+            for item in values:
+                csv_row.append(str(values[item]))
+            writer.writerow(csv_row)
+
         ##
         timer = Event()
 
@@ -436,12 +469,18 @@ class MultiCam:
                 # Do this just once at the start of a new recording session
                 if not started_saving:
                     self._l_finished_saving[cam_idx].clear()
+                    self._l_mqtt_readings[cam_idx].clear()
                     started_saving = True
 
                 # Main state of this thread: If the queue is not empty, save a new frame
-                if queue:
-                    frame_nb, frame = queue.popleft()
-                    save_frame(frame, frame_nb)
+                if queue or queue_mqtt:
+                    if queue:
+                        frame_nb, frame = queue.popleft()
+                        save_frame(frame, frame_nb)
+                    if queue_mqtt:
+                        frame_nb, mqtt_values = queue_mqtt.popleft()
+                        save_labels(csv_writer, frame_nb, mqtt_values)
+                    
 
                 # If we're writing fast enough, this thread should wait a bit
                 else:
@@ -450,13 +489,19 @@ class MultiCam:
                 # Recording is not set - either it hasn't started, or it has but hasn't finished yet
                 if started_saving:
                     # Recording has been started, so remaining frames still need to be saved
-                    if queue:
-                        frame_nb, frame = queue.popleft()
-                        save_frame(frame, frame_nb)
+                    if queue or queue_mqtt:
+                        if queue:
+                            frame_nb, frame = queue.popleft()
+                            save_frame(frame, frame_nb)
+                        if queue_mqtt:
+                            frame_nb, mqtt_values = queue_mqtt.popleft()
+                            save_labels(csv_writer, frame_nb, mqtt_values)
+                        
                     else:
                         self._close_videowriter(cam_idx)     # This does nothing if not in video mode
                         started_saving = False
                         self._l_finished_saving[cam_idx].set()
+                        csv_file.close()
                 else:
                     # Default state of this thread: if cameras are acquiring but we're not recording, just wait
                     timer.wait(0.1)
@@ -490,6 +535,7 @@ class MultiCam:
         cam = self._sources_list[cam_idx]
         queue_latest = self._l_latest_frames[cam_idx]
         queue_all = self._l_all_frames[cam_idx]
+        queue_mqtt = self._l_mqtt_readings[cam_idx]
 
         cam.start_grabbing()
 
@@ -501,6 +547,8 @@ class MultiCam:
                         frame = res.GetArray()
                         if self._recording:
                             queue_all.append((img_nb, frame))
+                            if self._mqtt_recording:
+                                queue_mqtt.append((img_nb, self.mqttlogger.values))
                         queue_latest.append(frame)
                         self._cnt_grabbed[cam_idx] += 1
                 except py.RuntimeException:     # This might happen if the camera stops grabbing during this loop

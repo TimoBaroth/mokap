@@ -20,6 +20,9 @@ with warnings.catch_warnings():
     warnings.filterwarnings('ignore', category=CryptographyDeprecationWarning)
     import paramiko
 
+import serial
+import paho.mqtt.client as mqtt
+
 ##
 
 def get_encoders(ffmpeg_path='ffmpeg', codec='hevc'):
@@ -257,6 +260,67 @@ class SSHTrigger:
         self.disconnect()
 
 
+
+## 
+
+class SerialTrigger:
+    """
+        Class to communicate with the hardware Trigger via Serial
+        It uses the environment variables to load the COM port
+    """
+
+    def __init__(self, silent=False):
+
+        self._connected = False
+        self._silent = silent
+
+        load_dotenv()
+
+        env_com = os.getenv('TRIGGER_COMPORT')
+
+        if env_com is None:
+            raise EnvironmentError(f'Missing comport.')
+        
+        self.serialdevice = serial.Serial(port='COM4', baudrate=9600)
+        if self.serialdevice:
+            self._connected = True
+            if not self._silent:
+                print('[INFO] Trigger connected')
+        else:
+            print('[WARN] Trigger unreachable')
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    def start(self, frequency: float) -> NoReturn:
+        """
+            Starts the trigger on a MCU
+        """
+        frq = int(np.floor(frequency))
+
+        if self.serialdevice  is not None:
+            self.serialdevice.write((str(frq) + '\r\n').encode('utf-8'))
+            if not self._silent:
+                print(f"[INFO] Trigger started at {frq} Hz")
+
+    def stop(self) -> NoReturn:
+        if self.serialdevice:
+            self.serialdevice.write((str(0) + '\r\n').encode('utf-8'))
+        time.sleep(0.1)
+        if not self._silent:
+            print(f"[INFO] Trigger stopped")
+
+    def disconnect(self) -> NoReturn:
+        if hasattr(self, 'serialdevice') and self.serialdevice:
+            self.serialdevice.close()
+            self.serialdevice = False
+
+    def __del__(self):
+        self.disconnect()
+
+
+
 ##
 
 class BaslerCamera:
@@ -364,7 +428,7 @@ class BaslerCamera:
 
         if not self._is_virtual:
 
-            self.ptr.ExposureTimeMode.SetValue('Standard')
+            #self.ptr.ExposureTimeMode.SetValue("Standard") #throws "Node is not writable : AccessException error"
             self.ptr.ExposureAuto = 'Off'
             self.ptr.GainAuto = 'Off'
             self.ptr.TriggerDelay.Value = 0.0
@@ -385,6 +449,8 @@ class BaslerCamera:
                 self.ptr.AcquisitionFrameRateEnable.SetValue(True)
 
         self._set_roi()
+        
+        
 
         self.binning = self._binning_value
         self.binning_mode = self._binning_mode
@@ -413,6 +479,12 @@ class BaslerCamera:
             self._height = 0
 
         self._connected = False
+
+    def set_userset(self, userset) -> NoReturn:
+        if self._connected:
+            self.ptr.UserSetSelector.SetValue(userset)
+            self.ptr.UserSetLoad.Execute()
+            
 
     def start_grabbing(self) -> NoReturn:
         if self._connected:
@@ -672,3 +744,133 @@ class BaslerCamera:
         else:
             return 'Ok'
 
+
+##
+
+class MQTTLogger:
+    
+    def __init__(self):
+        
+        load_dotenv()
+        self.mqtt_ip = os.getenv('MQTT_HOST')
+        self.mqtt_port =int(os.getenv('MQTT_PORT'))
+
+        
+        #MQTT topics => should be integrated in env/config, for now just copied here
+        TCS_topic = "MEWRP4/CartridePrintHead/SET_CartridgeTemperature"
+        TCA_topic = "MEWRP4/CartridePrintHead/ACT_CartridgeTemperature"
+        TRS_topic = "MEWRP4/CartridePrintHead/SET_RingTemperature"
+        TRA_topic="MEWRP4/CartridePrintHead/ACT_RingTemperature"
+        PS_topic="MEWRP4/CartridePrintHead/SET_Pressure"
+        PA_topic="MEWRP4/CartridgePrintHead/ACT_Pressure"
+        HVS_topic="MEWRP4/HighVoltage/SET_HVSupplyVoltage"
+        HVA_topic="MEWRP4/HighVoltage/ACT_HVSupplyVoltage"
+        S_topic = "CAXIS/speed_act"
+
+        #values 
+        self.values = {
+            "TCS": 0,
+            "TCA": 0,
+            "TRS": 0,
+            "TRA": 0,
+            "PS": 0,
+            "PA": 0,
+            "HVS": 0,
+            "HVA": 0,
+            "S": 0
+            }
+  
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1,protocol=mqtt.MQTTv5)
+        self.client.connect(self.mqtt_ip, self.mqtt_port) 
+        self.client.loop_start()
+        self.client.subscribe([(TCS_topic,2),(TCA_topic,2),(TRS_topic,2),(TRA_topic,2),(PS_topic,2),(PA_topic,2),(HVS_topic,2),(HVA_topic,2),(S_topic,2)])
+        self.client.message_callback_add(TCS_topic, self.TCS_callback) # add callback for specific topic
+        self.client.message_callback_add(TCA_topic, self.TCA_callback) # add callback for specific topic
+        self.client.message_callback_add(TRS_topic, self.TRS_callback) # add callback for specific topic
+        self.client.message_callback_add(TRA_topic, self.TRA_callback) # add callback for specific topic
+        self.client.message_callback_add(PS_topic, self.PS_callback) # add callback for specific topic
+        self.client.message_callback_add(PA_topic, self.PA_callback) # add callback for specific topic
+        self.client.message_callback_add(HVS_topic, self.HVS_callback) # add callback for specific topic
+        self.client.message_callback_add(HVA_topic, self.HVA_callback) # add callback for specific topic
+        self.client.message_callback_add(S_topic, self.S_callback) # add callback for specific topic
+
+    #for now just copied all the recall functions => should be unified 
+    def TCS_callback(self, client, userdata, message):
+        payload = message.payload.decode("utf-8")
+        try: 
+            self.values["TCS"] = float(payload)
+        except:
+            print("T_cartridge_set aquisition failed, received:" + payload)
+
+    def TCA_callback(self, client, userdata, message):
+        payload = message.payload.decode("utf-8")
+        payload = payload.split(",")
+        try: 
+            self.values["TCA"] = float(payload[1]) #value
+        except:
+            self.values["TCA"] = -1 #indcate error/invalid value
+            print("T_cartridge_act aquisition failed, received:" + payload)
+
+    def TRS_callback(self, client, userdata, message):
+        payload = message.payload.decode("utf-8")
+        try: 
+            self.values["TRS"] = float(payload)
+        except:
+            print("T_ring_set aquisition failed, received:" + payload)
+
+    def TRA_callback(self, client, userdata, message):
+        payload = message.payload.decode("utf-8")
+        payload = payload.split(",")
+        try: 
+            self.values["TRA"] = float(payload[1])
+        except:
+            self.values["TRA"] = -1 #indcate error/invalid value
+            print("T_ring_act aquisition failed, received:" + payload)
+
+    def PS_callback(self, client, userdata, message):
+        payload = message.payload.decode("utf-8")
+        try: 
+            self.values["PS"] = float(payload)
+        except:
+            print("P_set aquisition failed, received:" + payload)
+
+
+    def PA_callback(self, client, userdata, message):
+        payload = message.payload.decode("utf-8")
+        payload = payload.split(",")
+        try: 
+            self.values["PA"] = float(payload[1])
+        except:
+            self.values["PA"] = -1 #indcate error/invalid value
+            print("P_act aquisition failed, received:" + payload)
+
+
+    def HVS_callback(self, client, userdata, message):
+        payload = message.payload.decode("utf-8")
+        try: 
+            self.values["HVS"] = float(payload)
+        except:
+            print("HV_set aquisition failed, received:" + payload)
+
+    def HVA_callback(self, client, userdata, message):
+        payload = message.payload.decode("utf-8")
+        payload = payload.split(",")
+        try: 
+            self.values["HVA"] = float(payload[1])
+        except:
+            self.values["HVA"] = -1 #indcate error/invalid value
+            print("HV_act aquisition failed, received:" + payload)
+
+
+    def S_callback(self, client, userdata, message):
+        payload = message.payload.decode("utf-8")
+        #print(payload)
+        #payload = payload.split(",")
+        try: 
+            self.values["S"] = float(payload)
+        except:
+            self.values["S"] = -1
+            print("speed aquisition failed, received:" + payload)
+
+
+##
