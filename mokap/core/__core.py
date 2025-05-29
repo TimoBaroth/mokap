@@ -423,6 +423,7 @@ class MultiCam:
             else:
                 # If image mode
                 filepath = folder / f"{str(number).zfill(9)}.{self._saving_ext}"
+                filepath = folder / f"{str(number)}.{self._saving_ext}"
 
                 match self._saving_ext:
                     case 'bmp':

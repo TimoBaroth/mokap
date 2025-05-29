@@ -6,7 +6,7 @@ from mokap.core.hardware import MQTTLogger
 
 
 mqtt = MQTTLogger()
-mc = MultiCam(config='./config.yaml', triggered=False, silent=False, mqttlogger=mqtt)
+mc = MultiCam(config='./config.yaml', triggered=True, silent=False, mqttlogger=mqtt)
 
 # Example:
 # Set some default parameters for all cameras at once
@@ -14,8 +14,8 @@ mc = MultiCam(config='./config.yaml', triggered=False, silent=False, mqttlogger=
 mc.exposure = 5000
 mc.framerate = 50
 mc.gamma = 1.0
-mc.blacks = 1.0
-mc.gain = 0.0
+mc.blacks = 0
+mc.gain = 0
 
 
 if __name__ == '__main__':
